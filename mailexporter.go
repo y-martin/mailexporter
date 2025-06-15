@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+        "sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -34,7 +35,7 @@ var tokenLength = 40 // length of token for probing-mails
 const tokenChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 // muxer is used to map probe-tokens to channels where the detection-goroutine should put the found mails.
-var muxer = make(map[string]chan email)
+var muxer = sync.Map{}
 
 // disposeToken is used in probe to announce which tokens are no longer used for waiting for mails
 var disposeToken = make(chan string)
@@ -311,19 +312,35 @@ func send(c smtpServerConfig, msg string) error {
 
 	fullmail += "\r\n" + msg
 
-	var a smtp.Auth
-	if c.Login == "" && c.Passphrase == "" { // if login and passphrase are left empty, skip authentication
-		a = nil
-	} else {
-		a = smtp.PlainAuth("", c.Login, c.Passphrase, c.Server)
+	t1 := time.Now()
+        
+        client, err := smtp.Dial(c.Server+":"+c.Port)
+        if err != nil {
+           return err
+        }
+        defer client.Close()
+
+	if c.Login != "" && c.Passphrase != "" {
+            err = client.Auth(smtp.PlainAuth("", c.Login, c.Passphrase, c.Server))
+            if err != nil {
+               return err
+            }
 	}
 
-	t1 := time.Now()
-	err := smtp.SendMail(c.Server+":"+c.Port, a, c.From, []string{c.To}, []byte(fullmail))
+        client.Hello("mailexporter.dummydomain.")
+        client.Mail(c.From)
+        client.Rcpt(c.To)
+        mailw, err := client.Data()
+        if err != nil {
+           return err
+        }
+        mailw.Write([]byte(fullmail))
+        mailw.Close()
+
 	t2 := time.Now()
 	diff := t2.Sub(t1)
 
-	sendDuration := float64(diff.Seconds())
+        sendDuration := float64(diff.Seconds())
 	mailSendDuration.process(c.Name, sendDuration)
 
 	return err
@@ -363,7 +380,7 @@ func handleLateMail(m email) {
 
 // probe probes if mail gets through the entire chain from specified SMTPServer into Maildir.
 func probe(c smtpServerConfig, p payload) {
-	muxer[p.token] = make(chan email)
+	muxer.Store(p.token, make(chan email))
 
 	//send(c, string(p))
 	err := send(c, p.String())
@@ -375,8 +392,13 @@ func probe(c smtpServerConfig, p payload) {
 	}
 
 	timeout := time.After(globalconf.MailCheckTimeout)
+        ch, ok := muxer.Load(p.token)
+        if ! ok {
+            return
+        }
+        
 	select {
-	case mail := <-muxer[p.token]:
+	case mail := <-ch.(chan email):
 		logDebug.Println("checking mail for timeout")
 
 		deliverOk.WithLabelValues(c.Name).Set(1)
@@ -429,8 +451,8 @@ func detectAndMuxMail(watcher *fsnotify.Watcher) {
 					classifyMailMetrics(foundMail)
 
 					// then hand over so the timeout is judged
-					if ch, ok := muxer[foundMail.token]; ok {
-						ch <- foundMail
+					if ch, ok := muxer.Load(foundMail.token); ok {
+						ch.(chan email) <- foundMail
 					} else {
 						handleLateMail(foundMail)
 					}
@@ -440,8 +462,11 @@ func detectAndMuxMail(watcher *fsnotify.Watcher) {
 			logWarn.Println("watcher-error:", err)
 		case token := <-disposeToken:
 			// deletion of channels is done here to avoid interference with the report-case of this goroutine
-			close(muxer[token])
-			delete(muxer, token)
+                        ch, ok := muxer.LoadAndDelete(token)
+                        if ok {
+                            close(ch.(chan email))
+                        }
+
 		}
 	}
 }
